@@ -1,6 +1,6 @@
 # Account Interface Agreement
 
-We use this document to keep our three parts of SecureVault consistent. It records our shared function interfaces, data formats, and account rules.
+We use this document to keep our three parts of SecureVault consistent. It records the interfaces and formats we have shared so far, including our password-derivation measurements from step 7.
 
 ## 1. General Conventions
 
@@ -12,37 +12,7 @@ We use this document to keep our three parts of SecureVault consistent. It recor
 - Verification failure returns neither plaintext nor private keys.
 - Cryptographic primitives retain their standard internal byte ordering.
 
-## 2. Account Interfaces
-
-Responsible team member: Person 1
-
-| Function | Inputs | Successful result |
-|---|---|---|
-| `register` | Username and password | Identifies the registered user |
-| `login` | Username and password | Authenticated client session context |
-| `change_password` | Session context, old password, new password | Confirms a consistent password update |
-| `logout` | Session context | Invalidates the session; no return value |
-
-We call these functions from the client. The session stays on the client; we do not send the full session object over the shared directory.
-
-### Session representation
-
-We create a client session after a successful login.
-
-| Field | Type |
-|---|---|
-| `user_id` | bytes |
-| `username` | str |
-| `rsa_private` | dict with `n`, `e`, `d`, `p`, `q` |
-| `p256_private` | 32-byte scalar |
-| `created_at` | timestamp |
-| `expires_at` | `created_at` + 15 minutes |
-
-Sessions expire 15 minutes after login and are not renewed by activity; the
-user logs in again. `logout` invalidates the session immediately. An expired or
-invalidated session is treated as no session at all. We keep recovered private keys in the session and release our references to them when the session ends. This does not guarantee that Python overwrites their bytes in memory.
-
-## 3. Cryptographic Interfaces
+## 2. Cryptographic Interfaces
 
 | Function | Inputs | Output | Owner |
 |---|---|---|---|
@@ -55,13 +25,14 @@ invalidated session is treated as no session at all. We keep recovered private k
 | `rsa_keygen` | No arguments | `(private_key, public_key)` | Person 1 |
 | `pss_sign` | RSA private key, message bytes | 384-byte signature | Person 1 |
 | `pss_verify` | RSA public key, message bytes, signature bytes | Boolean | Person 1 |
-| `p256_keygen` | No application input | P-256 private/public key pair | Person 3 |
-| `aead_encrypt` | Key, nonce, AAD, plaintext as bytes | Separate ciphertext and tag | Person 2 |
-| `aead_decrypt` | Key, nonce, AAD, ciphertext, tag as bytes | Verified plaintext or failure | Person 2 |
+| `p256_keygen` | No arguments | `(private_key, public_key)` as 32-byte and 65-byte values | Person 3 |
+| `p256_validate_public` | Public-key bytes | Boolean | Person 3 |
+| `ecdh` | 32-byte private key, 65-byte public key | 32-byte shared x-coordinate | Person 3 |
 
-We call SHA-256 through `sha256(data)`. The current wrapper calls `SHA_256(message)` and returns a 32-byte digest. Person 2 is responsible for the shared SHA-256 module.
+We call SHA-256 through `sha256(data)`. Our wrapper calls our shared `SHA_256(message)` implementation and returns a 32-byte digest. Person 2 is responsible for the shared SHA-256 module.
 
-## 4. RSA Key Generation and Signatures
+
+## 3. RSA Key Generation and Signatures
 
 ### Key generation
 
@@ -83,6 +54,10 @@ We call SHA-256 through `sha256(data)`. The current wrapper calls `SHA_256(messa
 
 We use these dictionaries in memory. They do not define the serialized private-key format.
 
+### Public-key serialization
+
+We keep `n` and `e` as integers inside RSA functions. In the public-key record, we encode `n` as 384 bytes and `e = 65537` as exactly 3 bytes, both big-endian. The exponent bytes are `01 00 01`. We use `i2osp(e, 3)` when writing it and `os2ip` when converting it back to an integer. The 3-byte size belongs to our record format; it does not change the Python integer used by RSA.
+
 ### RSA-PSS parameters
 
 - RSA-3072.
@@ -103,24 +78,8 @@ For RSA, SHA-256, HMAC, and HKDF, we use reference libraries only in tests to co
 
 We test MGF1 outputs, signing and verification, compatibility with the reference library in both directions, and rejection of changed messages, wrong keys, malformed signatures, and incorrect salt lengths.
 
-## 5. Password Protection
+## 4. HMAC and HKDF
 
-- Password derivation uses Argon2id through `argon2-cffi`.
-- Each account receives a fresh 16-byte salt from OS cryptographic randomness.
-- The credential record stores the salt and Argon2id parameters.
-- Performance measurements determine the Argon2id work settings.
-- The private-key wrapping key remains client-side.
-
-- HKDF-SHA-256 derives the authentication and wrapping values from the
-  Argon2id output, which is used directly as the HKDF input keying material.
-- We use an empty HKDF salt for account-key derivation. Its input is the Argon2id output. We use different purpose labels to separate the authentication value from the wrapping key.
-
-| Derived value | Label | Length |
-|---|---|---|
-| Authentication value | `b"securevault:v1:auth"` | 32 bytes |
-| Private-key wrapping key | `b"securevault:v1:wrap"` | 32 bytes |
-
-### HMAC and HKDF implementation
 
 We implement these functions in `crypto/hmac_hkdf.py` using our shared `sha256` interface.
 
@@ -133,83 +92,133 @@ We implement these functions in `crypto/hmac_hkdf.py` using our shared `sha256` 
 
 We test published RFC 4231 HMAC-SHA-256 vectors and RFC 5869 HKDF-SHA-256 vectors, compare results with reference libraries, and check altered tags, key lengths, purpose labels, invalid output lengths, and short PRKs.
 
-## 6. Account Records
+## 5. Password Derivation
 
-We start shared objects with version and type fields. We use 4-byte length prefixes for variable-length fields and big-endian encoding for object-format integers. We serialize the same field values in the same way before signing or authenticating them.
+Responsible team member: Person 1
 
-| Record | Fields and fixed sizes |
+We use `derive_password_values(password, salt=None, params=None)` in `accounts.py`.
+
+- The password is a string, encoded as UTF-8 without normalization.
+- If no salt is supplied, we generate a fresh 16-byte salt using `secrets.token_bytes(16)`.
+- If no parameters are supplied, we load `benchmarks/password_config.json`.
+- For repeated derivation, we supply the same password, salt, and parameters.
+- We derive 32 bytes using Argon2id through `argon2-cffi`, then pass this output to our HKDF-SHA-256 twice.
+- We use an empty HKDF salt, `b""`, and different purpose labels.
+
+| Derived value | Label | Length |
+|---|---|---|
+| Authentication value | `b"securevault:v1:auth"` | 32 bytes |
+| Private-key wrapping key | `b"securevault:v1:wrap"` | 32 bytes |
+
+The function returns this local dictionary:
+
+| Field | Type |
 |---|---|
-| Credential | Version, type, user ID, 16-byte salt, Argon2id parameters, 32-byte authentication value |
-| Public key | Version, type, user ID, 65-byte P-256 public key, 384-byte RSA modulus, RSA public exponent |
-| Wrapped private key | Version, type, user ID, 12-byte nonce, ciphertext, 16-byte authentication tag |
+| `salt` | 16-byte value |
+| `argon2_params` | Dictionary of integer parameters |
+| `auth_value` | 32-byte value |
+| `wrap_key` | 32-byte value |
 
-We encrypt both the RSA and P-256 private material inside the wrapped private-key record. The 32-byte P-256 scalar length does not by itself specify its byte order or the complete private-record serialization.
+We keep `wrap_key` client-side. The returned dictionary is a local derivation result, not a serialized credential record. We do not include the password or raw Argon2id output in this result. Existing values are reproduced with their original salt and parameters, even if our default configuration changes.
 
-## 7. Storage and Account Handling
+### Selected Argon2id configuration
 
-| Data | Location |
+| Parameter | Value |
 |---|---|
-| Password and Argon2id output | Client-side processing |
-| Private-key wrapping key | Client-side only |
-| Unwrapped private keys | Client-side only |
-| Credential record | Server storage |
-| Public-key record | Server storage and client trust handling |
-| Wrapped private-key record | Server storage, retrieved by the client |
-| Trusted-key pins and verification status | Private client storage managed by Person 3 |
+| `memory_cost` | 131072 KiB = 128 MiB |
+| `time_cost` | 3 |
+| `parallelism` | 1 |
+| `hash_len` | 32 bytes |
+| `version` | 19 |
 
-We treat the shared directory as an attacker-controlled network. Authentication secrets must be protected during transfer. A challenge does not protect an authentication key that has already been exposed.
+Our parameter validator accepts exactly these five field names and integer values, excluding booleans. Its accepted ranges are 8192–262144 KiB for memory, 1–10 for time cost, and 1–8 for parallelism. Output length remains 32 bytes and version remains 19. These validation ranges are separate from the selected settings above.
 
-### Login exchange
+### Password tests
 
-During this login exchange, we send an HMAC response rather than the authentication value itself. The client and server exchange messages through the shared directory.
+We ran:
 
-1. The client sends the username.
-2. The server generates a fresh 32-byte challenge from OS cryptographic
-   randomness, stores it against the pending attempt, and returns it together
-   with the account's salt and Argon2id parameters.
-3. The client derives the authentication value from the password and replies
-   with `hmac_sha256(authentication_value, challenge)`.
-4. The server recomputes the tag from its stored authentication value and the challenge, then uses `compare_tags` to check the response. It consumes the challenge on the first response, whether the check succeeds or fails. Login proceeds only if the check succeeds.
+```powershell
+python -m pytest tests/test_accounts.py -k derivation
+```
 
-A challenge is valid for 60 seconds and for one response only. It is deleted
-once used, so the same response is not accepted again for that attempt. The challenge is consumed atomically to prevent two simultaneous responses from using it. An observer sees the challenge and its HMAC response, but the authentication value is not sent by this exchange.
+All 8 derivation tests passed. They cover changed passwords, fresh salts, invalid inputs, reference comparison, repeated inputs, selected configuration, separate authentication and wrapping values, and two users. Our test password is `Test-only-password-123!`. Different salts produce different derivation results; identical inputs reproduce the same values.
 
-Expired challenges, reused challenges, wrong passwords, and unknown usernames
-all produce the same authentication-failure response, with no detail
-distinguishing them.
+### Password measurements
 
-### Unknown-user handling
+We ran:
 
-We aim to give the same failure response and similar processing time for unknown usernames and wrong passwords. Step 2 of the login exchange returns a salt and
-Argon2id parameters before any password check, so an unknown username must
-produce a response of the same shape.
+```powershell
+python -m benchmarks.passwords
+```
 
-For an unknown username the server derives a dummy salt as the first 16 bytes
-of `hmac_sha256(server_dummy_key, username.encode("utf-8"))`, where `server_dummy_key` is a
-32-byte value generated from OS cryptographic randomness once when the server
-is initialised and stored server-side. The derivation is deterministic, so repeated requests for the same unknown username return the same salt. This avoids revealing unknown users through a salt that changes on every request.
+We measured Argon2id plus both HKDF derivations, with one warm-up per candidate and five measured repetitions per candidate. We varied 64/128 MiB memory, 2/3 iterations, and 1/4 lanes. We randomized the candidate order between rounds.
 
-The server returns the measured Argon2id settings and reads a dummy credential record from disk. It computes `hmac_sha256(dummy_authentication_value, challenge)` and compares that tag with the response using `compare_tags`. An unknown username is rejected regardless of the comparison result.
+| Memory (KiB) | Time cost | Parallelism | Median (seconds) |
+|---|---|---|---|
+| 65536 | 2 | 1 | 0.0797 |
+| 65536 | 2 | 4 | 0.0338 |
+| 65536 | 3 | 1 | 0.1124 |
+| 65536 | 3 | 4 | 0.0471 |
+| 131072 | 2 | 1 | 0.1602 |
+| 131072 | 2 | 4 | 0.0662 |
+| 131072 | 3 | 1 | 0.2301 |
+| 131072 | 3 | 4 | 0.0870 |
 
-We use similar operations on both paths: read a credential record, return a salt and parameters, compute an HMAC, and compare tags. Similar operations alone do not guarantee equal timing. Wrong-password and unknown-user
-attempts produce the same authentication-failure response, and neither creates
-an authenticated session.
+We recorded these measurements on 13 September 2026 using Windows 11, AMD64, 22 logical CPUs, Python 3.13.14, and argon2-cffi 25.1.0. The reported processor identifier is `Intel64 Family 6 Model 170 Stepping 4, GenuineIntel`.
 
-Our timing-test criterion is fixed before measurement: across 500 interleaved attempts,
-the difference between the median times of the two paths must be under 5% of
-the larger median. A persistent difference above that threshold fails. Passing only shows that this median-time criterion was met under the test conditions; it does not prove that account existence cannot be inferred.
+We selected 128 MiB, 3 iterations, and 1 lane because its median was closest to our 0.25-second target among the eight measured candidates. Its measured range was about 0.2252–0.2375 seconds. This is our measured derivation time on this machine, not a guaranteed runtime or a full-login measurement.
 
-Verification errors use a limited set of categories, including `Malformed object`, `Key mismatch`, `Verification failed`, and `Stale object`.
-
-Password changes require authorization and verification of the old password. They replace authentication and wrapping values while preserving the existing RSA and P-256 key pairs. Credential and wrapped-key updates must remain consistent after interruption.
-
-
-## 8. Team Responsibilities
-
-| Person | Components provided |
+| File | Purpose |
 |---|---|
-| Person 1 | Account and session handlers; RSA key generation and RSA-PSS; HMAC and HKDF; private-key wrapping and recovery; tests for these components |
-| Person 2 | SHA-256 and AEAD; shared serialization; shared-directory transport; server dispatch and storage; support for consistent account updates |
-| Person 3 | P-256 key generation and key representations; public-key validation; trust and sharing integration |
+| `benchmarks/password_measurements.json` | Records hardware, software, candidate parameters, repeated timings, and the reason for our selection |
+| `benchmarks/password_config.json` | Stores the five selected parameters loaded by `accounts.py` |
 
-Each of us is responsible for the components listed above. We use the shared interfaces when connecting our code so that the three parts work together.
+These JSON files store measurement and configuration data, not account passwords or derived keys.
+
+## 6. P-256 Key Representation
+
+Responsible team member: Person 3
+
+We use the representations in the shared `p256.py` file:
+
+- Private key: a 32-byte big-endian scalar, with value from 1 to the curve order minus 1.
+- Public key: 65-byte uncompressed form, `0x04 || x || y`, with each coordinate encoded as 32 bytes, big-endian.
+- `p256_keygen()` returns the private key first and the public key second.
+- `p256_validate_public(public_key)` checks the encoding and curve point and returns a boolean.
+- `ecdh(private_key, public_key)` validates its key inputs and returns the shared point's x-coordinate as 32 big-endian bytes.
+
+## 7. Shared Object Formats
+
+Responsible team member: Person 2
+
+We use the layouts in the shared `formats.py` file. Each object starts with a one-byte version and a one-byte type. The current version is 1. `pack_str(data)` writes a 4-byte big-endian byte length followed by the data; `unpack_str(buffer, offset)` returns the data and next offset. Despite the name, these functions take byte fields.
+
+The tables below show field order after the two-byte header. `LP(field)` means a length-prefixed byte field. Fixed fields have no length prefix.
+
+| Object | Type | Fields in order |
+|---|---|---|
+| `Credential` | 1 | `LP(user_id)`, salt (16), `LP(argon2_params)`, auth value (32) |
+| `PublicKey` | 2 | `LP(user_id)`, P-256 public key (65), RSA modulus (384), RSA exponent (3) |
+| `WrappedPrivateKey` | 3 | `LP(user_id)`, nonce (12), `LP(ciphertext)`, tag (16) |
+| `Document` | 4 | document ID (16), `LP(owner_id)`, `LP(filename)`, `LP(mime_type)`, size (8), timestamp (8), nonce (12), `LP(ciphertext)`, tag (16) |
+| `Share` | 5 | document ID (16), `LP(sender_id)`, `LP(recipient_id)`, sender fingerprint (32), recipient fingerprint (32), sequence number (8), timestamp (8), ephemeral public key (65), `LP(wrapped_document_key)`, signature (384) |
+
+We encode size, timestamp, and sequence number as unsigned big-endian integers. Text fields are encoded as UTF-8 before serialization.
+
+`Document.get_aad()` returns the document ID, length-prefixed owner ID, filename and MIME type, followed by size and timestamp. `Share.signed_bytes()` returns the share fields through the wrapped document key. In the current file, neither method includes the version/type header.
+
+The format classes provide `to_bytes()` and `from_bytes()`. These layouts describe the shared file; they do not establish that account, document, or sharing flows have been integrated and tested. The `Credential` class receives `argon2_params` as bytes, while `derive_password_values()` returns them as a dictionary. We do not define a new encoding for that dictionary in this document.
+
+## 8. Libraries and Current Team Work
+
+We wrote our shared SHA-256 implementation to keep our work consistent. Our RSA, PSS, HMAC, and HKDF code uses our own implementations. We use `argon2-cffi` for Argon2id. Reference cryptographic libraries are used in tests to compare results with ours.
+
+Standard Python modules used for randomness, paths, JSON, timing, statistics, and machine information support the implementation and measurements. They do not replace our cryptographic functions. We use `pytest` to run the tests.
+
+| Person | Current work covered here |
+|---|---|
+| Person 1 | RSA key generation and PSS; HMAC and HKDF; password derivation; associated tests and Argon2id measurements |
+| Person 2 | Our shared SHA-256 interface and the supplied object-format definitions |
+| Person 3 | Supplied P-256 key generation, public-key validation, and ECDH interfaces |
+
+We keep the byte sizes, function arguments, and labels consistent when connecting these parts.
