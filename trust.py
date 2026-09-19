@@ -1,11 +1,19 @@
-from crypto.sha256 import sha256
+from crypto.formats import PublicKey
 from crypto.p256 import p256_validate_public
+from crypto.sha256 import sha256
 
+RSA_MODULUS_LEN = 384
+RSA_EXPONENT_LEN = 3
 
-def _add_length(data):
-    return len(data).to_bytes(4,"big") + data
 
 def _build_key_data(user_id, p256_public_key, rsa_public_key, rsa_public_exponent):
+    """Return the canonical PublicKey record bytes for this key.
+
+    The fingerprint is taken over exactly the bytes that are stored and sent,
+    so the value a user compares out of band is the same value the account
+    code reports at login.  Rebuilding a separate layout here is what let the
+    two definitions drift apart.
+    """
     if not isinstance(user_id, str):
         raise TypeError("User ID must be a string")
 
@@ -18,36 +26,36 @@ def _build_key_data(user_id, p256_public_key, rsa_public_key, rsa_public_exponen
     if not p256_validate_public(p256_public_key):
         raise ValueError("Invalid P256 public key")
 
-    if not isinstance(rsa_public_key, int):
+    if not isinstance(rsa_public_key, int) or isinstance(rsa_public_key, bool):
         raise TypeError("RSA public key must be an integer")
 
     if rsa_public_key < 0:
         raise ValueError("Invalid RSA public key")
 
-    if not isinstance(rsa_public_exponent, int):
+    if not isinstance(rsa_public_exponent, int) or isinstance(rsa_public_exponent, bool):
         raise TypeError("RSA exponent must be an integer")
 
     if rsa_public_exponent <= 0:
         raise ValueError("Invalid RSA exponent")
 
-    user_bytes = user_id.encode("utf-8")
-    rsa_bytes = rsa_public_key.to_bytes(384, "big")
-    exponent_bytes = rsa_public_exponent.to_bytes(
-        (rsa_public_exponent.bit_length() + 7) // 8,
-        "big"
+    if rsa_public_key >= 1 << (8 * RSA_MODULUS_LEN):
+        raise ValueError("RSA modulus does not fit the record format")
+
+    if rsa_public_exponent >= 1 << (8 * RSA_EXPONENT_LEN):
+        raise ValueError("RSA exponent does not fit the record format")
+
+    record = PublicKey(
+        user_id.encode("utf-8"),
+        p256_public_key,
+        rsa_public_key.to_bytes(RSA_MODULUS_LEN, "big"),
+        rsa_public_exponent.to_bytes(RSA_EXPONENT_LEN, "big"),
     )
 
-    data = b""
-    data += _add_length(user_bytes)
-    data += _add_length(p256_public_key)
-    data += _add_length(rsa_bytes)
-    data += _add_length(exponent_bytes)
-
-    return data
+    return record.to_bytes()
 
 
 def fingerprint_public_key(user_id, p256_public_key, rsa_public_key, rsa_public_exponent):
-    
+
     data = _build_key_data(
         user_id,
         p256_public_key,
@@ -58,7 +66,7 @@ def fingerprint_public_key(user_id, p256_public_key, rsa_public_key, rsa_public_
     return sha256(data)
 
 
-def fingerprint_hex(user_id, p256_public_key,rsa_public_key, rsa_public_exponent):
+def fingerprint_hex(user_id, p256_public_key, rsa_public_key, rsa_public_exponent):
 
     fingerprint = fingerprint_public_key(
         user_id,
@@ -93,7 +101,7 @@ def trust_first_key(trusted_keys, user_id, p256_public_key, rsa_public_key, rsa_
     return True
 
 
-def check_trusted_key(trusted_keys, user_id, p256_public_key,rsa_public_key, rsa_public_exponent):
+def check_trusted_key(trusted_keys, user_id, p256_public_key, rsa_public_key, rsa_public_exponent):
 
     if user_id not in trusted_keys:
         return False
