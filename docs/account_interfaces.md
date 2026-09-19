@@ -1,6 +1,6 @@
 # Account Interface Agreement
 
-We use this document to keep our work on SecureVault consistent across the three of us. It brings together our agreed interfaces, data formats, cryptographic parameters, and the behavior we have implemented and tested for password derivation, private-key recovery, and local registration.
+We use this document to keep our work on SecureVault consistent across the three of us. It brings together our agreed interfaces, data formats, cryptographic parameters, and the account behavior we have implemented and tested so far, including registration, login, sessions, private-key recovery, and password changes.
 
 ## General Conventions
 
@@ -28,8 +28,8 @@ We use this document to keep our work on SecureVault consistent across the three
 | `p256_keygen` | No arguments | `(private_key, public_key)` as 32-byte and 65-byte values | Person 3 |
 | `p256_validate_public` | Public-key bytes | Boolean | Person 3 |
 | `ecdh` | 32-byte private key, 65-byte public key | 32-byte shared x-coordinate | Person 3 |
-| `chacha20_poly1305_encrypt` | Key, nonce, plaintext, AAD | `(ciphertext, tag)` as separate byte values | Person 2 |
-| `chacha20_poly1305_decrypt` | Key, nonce, ciphertext, tag, AAD | Authenticated plaintext or `ValueError` | Person 2 |
+| `aead_encrypt` | Key, nonce, AAD, plaintext | `(ciphertext, tag)` as separate byte values | Person 2 |
+| `aead_decrypt` | Key, nonce, AAD, ciphertext, tag | Authenticated plaintext or `AuthenticationError` | Person 2 |
 
 We call SHA-256 through `sha256(data)`. Our wrapper calls our shared `SHA_256(message)` implementation and returns a 32-byte digest. Person 2 is responsible for the shared SHA-256 module.
 
@@ -256,7 +256,7 @@ We check that the P-256 scalar is in range, the public point is valid, and the p
 
 We encrypt the complete bundle using ChaCha20-Poly1305 with the 32-byte wrapping key. Each call generates a fresh 12-byte nonce using `secrets.token_bytes`. The public function does not accept a supplied nonce. Our deterministic tests replace the random function only inside the test.
 
-The AAD binds the outer version, type, and length-prefixed user ID using `WrappedPrivateKey.get_aad()`. The nonce, ciphertext, and 16-byte tag are stored in the outer record. Our AEAD interface checks key and nonce lengths and compares the received tag using `secrets.compare_digest` before decrypting.
+The AAD binds the outer version, type, and length-prefixed user ID using `WrappedPrivateKey.get_aad()`. The nonce, ciphertext, and 16-byte tag are stored in the outer record. Our AEAD interface checks key and nonce lengths and compares the received tag using `secrets.compare_digest` before decrypting. `aead_decrypt()` raises `AuthenticationError`, which is a subclass of `ValueError`; the account-side recovery code converts authentication failures to the same generic `Verification failed` result.
 
 Recovery accepts a `WrappedPrivateKey` object or its serialized bytes. We supply the expected user ID independently and check it against the record. We authenticate the ciphertext before calling `parse_bundle`, and return the keys only after the recovered bundle also passes validation. Wrong identities, failed authentication, and malformed bundles raise exceptions without returning private material.
 
@@ -304,36 +304,229 @@ An interruption before commit leaves no published account. An interruption after
 
 This adapter is for local integration. We have not connected it to our shared-directory transport yet. The database belongs to the server's local storage, not to the directory used to exchange network messages. `register_account()` runs both sides locally for tests and demonstrations.
 
-### Current authentication compatibility
+## Login and Unknown-Account Handling
 
-We preserve `credential_verifier(auth_value) = sha256(auth_value)` from the current registration code. Storing this hash does not by itself provide replay protection or protect registration messages in transit. A server holding this verifier cannot directly check an HMAC keyed by the original authentication value. We have not connected this representation to a final login or protected registration-transfer protocol.
+We use a challenge-response login flow. The account functions are kept separate from the transport so the shared-directory transport can call the same handlers without changing the account logic.
+
+A login starts with `begin_login()`. The challenge returned to the client contains the same type of fields whether the username exists or not:
+
+| Field | Size / meaning |
+|---|---|
+| `user_id` | UTF-8 user ID |
+| `challenge_id` | 16 random bytes |
+| `challenge` | 32 random bytes |
+| `salt` | 16 bytes |
+| `argon2_params` | 20-byte encoded parameter set |
+| `expires_at` | Challenge expiry time |
+
+Challenges are valid for 30 seconds. The server keeps their state locally and consumes a challenge on the first finish attempt, whether that attempt succeeds or fails. Reusing the same challenge therefore fails.
+
+For an existing user, we return the stored salt and Argon2id parameters. For an unknown user, we return a dummy salt with the same format and the normal Argon2id parameters. The dummy salt is stable for the same unknown username and is derived from a server-side random secret. This keeps the external path for an unknown username close to the path for a real account.
+
+The client derives the password values from the challenge salt and parameters. It keeps the wrapping key locally and builds the login response from the authentication side only:
+
+```text
+login_key = SHA-256(auth_value)
+response = HMAC-SHA-256(login_key, login_transcript)
+```
+
+The deterministic login transcript contains the user ID, challenge ID, random challenge, salt, Argon2id parameters, and expiry time. The network response contains the challenge ID and HMAC response, not the password, wrapping key, raw Argon2id result, or private keys.
+
+`finish_login()` reconstructs the original transcript from the stored challenge state and verifies the response. Known accounts use the stored credential verifier. Unknown accounts follow the same response-processing path with a dummy key.
+
+Wrong passwords, unknown usernames, altered responses, expired challenges, and replayed challenges use the same external failure:
+
+```text
+Authentication failed
+```
+
+After a valid response, the server creates a session for the authenticated user and returns the public-key record and wrapped-private-key record needed by the client. The client unwraps the private bundle using the wrapping key it derived locally. We do not return private material if the server-side authentication check fails.
+
+The recovered P-256 and RSA public keys are checked against the stored `PublicKey` record before login completes. A changed public-key record, wrapped-private-key record, user ID, nonce, ciphertext, or tag causes recovery to fail.
+
+### Login timing behavior
+
+We test wrong-password and unknown-user attempts repeatedly in interleaved order. The two cases use the same external failure message, and our timing test compares their sample medians using this tolerance:
+
+```text
+max(15 ms, 25% of the larger median)
+```
+
+Passing this test is evidence that the two paths are not persistently distinguishable in our test environment. It is not a claim that timing leakage is impossible on every machine.
+
+### Login limitation
+
+The stored credential verifier is also the value the server uses to verify the login HMAC. This means a stolen credential database does not reveal the password or the private-key wrapping key, but possession of the stored verifier can be useful for protocol impersonation. We keep this as an explicit limitation rather than treating the verifier as equivalent to the password.
+
+## Session Handling
+
+A successful login creates a server-side session bound to the authenticated account.
+
+Each session stores:
+
+| Field | Meaning |
+|---|---|
+| `session_id` | 16 random bytes |
+| `user_id` | Identity fixed by the authenticated login |
+| `expires_at` | Expiration time |
+| `invalidated` | Server-side invalidation state |
+
+The current session lifetime is 15 minutes. Expired and invalidated sessions are rejected.
+
+For each successful login, both sides derive a request-authentication key:
+
+```text
+session_key = HKDF-SHA-256(
+    IKM = login_key,
+    salt = session_id,
+    info = b"securevault:v1:session-key",
+    length = 32
+)
+```
+
+The client derives this from the login key it already has. The server derives the same value from the stored credential verifier. We do not store a separate session MAC key in the database.
+
+Authenticated requests contain:
+
+| Field | Size / format |
+|---|---|
+| `session_id` | 16 bytes |
+| `request_id` | 16 fresh random bytes |
+| `user_id` | Claimed UTF-8 identity |
+| `operation` | Byte string |
+| `payload` | Byte string |
+| `tag` | 32-byte HMAC-SHA-256 tag |
+
+The HMAC covers the session ID, request ID, user ID, operation, and payload in one deterministic transcript.
+
+The identity carried inside the request does not decide who the request belongs to. The authenticated identity comes from the server-side session record. If a request tries to name another user, it is rejected even if the sender has a valid session.
+
+After a request passes the session, identity, and HMAC checks, the server records its `request_id`. Reusing the same `(session_id, request_id)` is rejected as a replay. These replay records are kept in SQLite, so reopening the server storage does not make an already accepted request valid again.
+
+A request that fails HMAC or identity verification does not consume its request ID.
+
+`validate_session()` checks the stored session state. Normal authenticated operations use `validate_session_request()` so possession of a session ID alone is not enough. `invalidate_session()` marks a session unusable, and the same generic external failure is used for missing, altered, expired, invalidated, identity-mismatched, unauthenticated, or replayed requests:
+
+```text
+Authentication failed
+```
+
+## Password Changes and Recovery
+
+Changing a password does not change the user's RSA or P-256 identity keys. We recover the existing private-key bundle with the old password, derive new password-dependent values, and wrap the same bundle again under the new wrapping key.
+
+### Password-change context
+
+The client obtains the current account material through an authenticated session request. The returned context contains:
+
+| Field | Meaning |
+|---|---|
+| `user_id` | Identity bound to the session |
+| `salt` | Current 16-byte Argon2id salt |
+| `argon2_params` | Current encoded Argon2id parameters |
+| `public_key` | Current serialized public-key record |
+| `wrapped_private_key` | Current serialized encrypted private-key bundle |
+
+We do not include the stored credential verifier in this context.
+
+The operation name used for this request is:
+
+```text
+b"password-change-context"
+```
+
+### Client-side change
+
+`prepare_password_change()` uses the old password with the current salt and parameters. The old wrapping key must successfully recover the current private-key bundle before the change continues. We also check that the recovered RSA and P-256 public keys still match the current public-key record.
+
+The new password is derived with a fresh 16-byte salt. We generate a new authentication value and a new wrapping key, then re-encrypt the same private-key bundle. A new `Credential` record and `WrappedPrivateKey` record are created, while the `PublicKey` record stays unchanged.
+
+The client also creates an old-password proof:
+
+```text
+proof = HMAC-SHA-256(old_login_key, proof_transcript)
+```
+
+The proof binds the session, user ID, current salt and parameters, the hashes of the current public and wrapped-private-key records, and the hash of the proposed new credential/wrapped-key body.
+
+The normal session HMAC protects the complete password-change request as well. The password, old wrapping key, new wrapping key, and unwrapped private keys never appear in the transport payload.
+
+### Atomic server update
+
+`handle_password_change()` first validates the authenticated session request and then verifies the old-password proof using the current credential state.
+
+The storage update is performed by `AccountStore.update_password_records()` in one SQLite transaction. The transaction:
+
+- checks that the current credential and wrapped-private-key records are still the exact records on which the change was prepared;
+- replaces the credential record;
+- replaces the wrapped-private-key record;
+- invalidates all existing sessions for the user;
+- commits the complete change together.
+
+The public-key record is not modified. The RSA and P-256 identity keys and the public-key fingerprint therefore remain the same after the password changes.
+
+A stale password-change request cannot overwrite a newer password state because the expected current records must still match.
+
+### Session policy after a password change
+
+A successful password change invalidates every existing session for that account, including the session that performed the change. The user must log in again with the new password.
+
+If the old password is wrong, the existing private-key bundle cannot be recovered and the change does not proceed. The stored account state and current sessions stay unchanged.
+
+### Interrupted updates
+
+The credential replacement, wrapped-private-key replacement, and session invalidation are one transaction.
+
+If an interruption happens before commit, the complete old password state remains. If commit has already completed, the complete new state remains. We do not accept a mixed state such as a new credential with the old wrapped private-key record.
+
+If a request ID was consumed but the password transaction did not commit, the client creates a new authenticated request with a fresh request ID after checking which password state is active. If the commit completed but the response was lost, the new password is already active and the old sessions are already invalidated.
 
 ## Current Test Results
 
-We ran the corrected private-key and account tests together on Windows:
+Our account test file now covers password derivation, registration, login, unknown-account handling, timing behavior, sessions, replay protection, and password changes.
+
+After the password-change work was added, we ran:
 
 ```powershell
-python -m pytest tests/test_private_keys.py tests/test_accounts.py -v --tb=short
+python -m pytest tests/test_accounts.py
 ```
 
-The run passed 55 tests and 52 subtests in 69.04 seconds. It includes our eight password-derivation tests.
+The complete run passed all 55 tests on Windows with Python 3.13.14.
 
-Our private-key tests cover serialization, key consistency, correct recovery, signing after recovery, changed nonce/ciphertext/tag, wrong wrapping keys, changed identities, malformed records, and rejection before private-bundle parsing when authentication fails. They also reject an invalid inner bundle with a valid AEAD tag.
+We also ran the focused account checks after the session and password-change updates:
 
-Our registration tests cover two users with the same password, distinct records, duplicate IDs, malformed public keys and records, parameter validation, recovery of stored wrapped keys, and absence of the tested plaintext secrets from serialized records and the local database. We test exceptions after each write, abrupt process exit before and after commit, reopening storage, retry, and concurrent duplicate registrations.
+```powershell
+python -m pytest tests/test_accounts.py -k session
+python -m pytest tests/test_accounts.py -k login
+python -m pytest tests/test_accounts.py -k timing
+```
 
-These results apply to the current local adapter and temporary Poly1305 implementation. They do not establish shared-directory transport security or physical disk-failure behavior.
+The latest runs passed 16 session tests, 13 login-related tests, and the timing test. The full 55-test run also includes the password-change cases together with the earlier derivation and registration tests.
+
+The account tests cover correct and incorrect passwords, unknown usernames, altered and replayed login challenges, session expiry and invalidation, identity changes inside authenticated requests, captured-request replay, fresh salts, unchanged RSA/P-256 identity keys after password changes, all-session invalidation after a successful change, and interrupted account updates.
+
+The private-key tests remain responsible for serialization, key consistency, correct recovery, modified nonce/ciphertext/tag handling, wrong wrapping keys, changed identities, malformed bundles, and the rule that private-bundle parsing only happens after successful authentication.
+
+These results cover our current local account/storage implementation. Final shared-directory transport and application integration are still separate work.
 
 ## Libraries and Team Responsibilities
 
-We wrote our shared SHA-256 implementation to keep our work consistent. Our RSA, PSS, HMAC, and HKDF code uses our own implementations. We use `argon2-cffi` for Argon2id. Reference cryptographic libraries are used in tests to compare results with ours. Our current Poly1305 module is also a temporary wrapper around `cryptography` for integration testing; we are using it until our team implementation is ready. We will replace it and rerun the tests before treating that primitive as complete.
+We keep implementation ownership separate even when one part depends on another member's interface.
 
-Standard Python modules used for randomness, paths, JSON, timing, statistics, machine information, and SQLite storage support the implementation and measurements. They do not replace our cryptographic functions. We use `pytest` to run the tests.
+Our shared SHA-256 implementation is owned by Person 2. RSA key generation, RSA-PSS, HMAC-SHA-256, and HKDF-SHA-256 are our own implementations on the Person 1 side. We use `argon2-cffi` for Argon2id. Reference cryptographic libraries are used in tests for comparison. Person 2 owns ChaCha20, Poly1305, ChaCha20-Poly1305, the shared object formats, and the application transport/storage integration. Person 3 owns the P-256 arithmetic, key generation, validation, ECDH, trust, sharing, and freshness side.
+
+Standard Python modules are used for randomness, paths, JSON, timing, statistics, machine information, and SQLite storage. `pytest` is used for the test suite.
 
 | Person | Current work covered here |
 |---|---|
-| Person 1 | RSA key generation and PSS; HMAC and HKDF; password derivation; private-key wrapping and recovery; local registration and atomic storage adapter; associated tests and measurements |
-| Person 2 | Shared SHA-256, supplied ChaCha20/AEAD interfaces, and object-format definitions |
-| Person 3 | Supplied P-256 key generation, public-key validation, and ECDH interfaces |
+| Person 1 | RSA key generation and PSS; HMAC and HKDF; password derivation and measurements; private-key wrapping and recovery; registration; login and unknown-account handling; session handling and replay protection; password changes; local account storage and related tests |
+| Person 2 | Shared SHA-256; ChaCha20/Poly1305/AEAD; shared object formats; document/infrastructure work; final transport and server/client integration |
+| Person 3 | P-256 key generation and validation; ECDH; public-key trust; sharing and freshness work |
 
-We keep the byte sizes, function arguments, and labels consistent when connecting these parts.
+The account code uses Person 2's shared formats and AEAD and Person 3's P-256 interfaces, but those implementations remain owned by their assigned members. We keep the agreed byte sizes, function arguments, labels, and record layouts consistent across the three parts.
+
+## Current Account Boundary
+
+At this point, the account side covers password derivation, RSA and P-256 account key creation, protected private-key storage, atomic registration, login with unknown-account handling, session creation and validation, session expiry and invalidation, request authentication and replay rejection, and consistent password changes with atomic recovery behavior.
+
+The next account work is final application integration with Person 2's real shared-directory transport and server/client dispatch. Sharing integration then connects the account/signature interfaces to Person 3's sharing flow.
