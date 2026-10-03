@@ -4,4 +4,5 @@ __pycache__/
 .pytest_cache/
 
 local_data/
-.env
+.envserver_private/
+*.db

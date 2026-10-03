@@ -1,0 +1,9 @@
+﻿.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+local_data/
+.envserver_private/
+client_local/
+shared_network/

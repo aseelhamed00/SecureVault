@@ -1,5 +1,4 @@
-# SHA-256 owned by Person 2. Shared course reference implementation,
-# exposed through the agreed sha256(data) interface.
+
 
 
 def right_rotate(x, n):
